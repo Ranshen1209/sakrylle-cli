@@ -2,7 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use chrono::Utc;
-use codex_client::build_reqwest_client_with_custom_ca;
+use codex_http_client::build_reqwest_client_with_custom_ca;
 use jsonwebtoken::Algorithm;
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::Validation;
@@ -12,7 +12,72 @@ use jsonwebtoken::jwk::JwkSet;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::server::OidcDiscovery;
+/// Default Sakrylle OIDC issuer. Override with `SAKRYLLE_OIDC_ISSUER`.
+pub const SAKRYLLE_ISSUER: &str = "https://sub.sakrylle.com";
+const SAKRYLLE_OIDC_ISSUER_ENV: &str = "SAKRYLLE_OIDC_ISSUER";
+pub(crate) const SAKRYLLE_SCOPE: &str =
+    "openid profile email models:read responses:create messages:create usage:read offline_access";
+
+/// OpenID Connect discovery document used by Sakrylle login.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcDiscovery {
+    pub issuer: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    #[serde(default)]
+    pub userinfo_endpoint: Option<String>,
+    pub jwks_uri: String,
+    #[serde(default)]
+    pub device_authorization_endpoint: Option<String>,
+    #[serde(default)]
+    pub end_session_endpoint: Option<String>,
+    #[serde(default)]
+    pub code_challenge_methods_supported: Option<Vec<String>>,
+    #[serde(default)]
+    pub id_token_signing_alg_values_supported: Option<Vec<String>>,
+}
+
+/// Resolve the Sakrylle issuer from the environment or the product default.
+pub fn resolve_issuer() -> String {
+    std::env::var(SAKRYLLE_OIDC_ISSUER_ENV).unwrap_or_else(|_| SAKRYLLE_ISSUER.to_string())
+}
+
+/// Whether this issuer should use Sakrylle OIDC behavior (discovery, scope, callback path).
+pub fn is_sakrylle_issuer(issuer: &str) -> bool {
+    let trimmed = issuer.trim_end_matches('/');
+    if trimmed == SAKRYLLE_ISSUER || trimmed == resolve_issuer().trim_end_matches('/') {
+        return true;
+    }
+    url::Url::parse(trimmed)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("sub.sakrylle.com") || host.ends_with(".sakrylle.com")
+        })
+}
+
+/// Fetch the OpenID Connect discovery document for `issuer`.
+pub async fn fetch_discovery(issuer: &str) -> io::Result<OidcDiscovery> {
+    let issuer = issuer.trim_end_matches('/');
+    require_trusted_url("issuer", issuer)?;
+    let url = format!("{issuer}/.well-known/openid-configuration");
+    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
+    let resp = client
+        .get(&url)
+        .timeout(OIDC_HTTP_TIMEOUT)
+        .send()
+        .await
+        .map_err(io::Error::other)?;
+    if !resp.status().is_success() {
+        return Err(io::Error::other(format!(
+            "OIDC discovery failed with status {}",
+            resp.status()
+        )));
+    }
+    resp.json::<OidcDiscovery>()
+        .await
+        .map_err(|err| io::Error::other(format!("failed to parse OIDC discovery: {err}")))
+}
 
 const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const OIDC_CLOCK_SKEW_SECS: u64 = 60;
@@ -103,7 +168,9 @@ pub(crate) fn validate_discovery(
     }
 
     if let Some(algs) = discovery.id_token_signing_alg_values_supported.as_ref()
-        && !algs.iter().any(|alg| parse_allowed_algorithm(alg).is_some())
+        && !algs
+            .iter()
+            .any(|alg| parse_allowed_algorithm(alg).is_some())
     {
         return Err(io::Error::other(
             "OIDC discovery does not advertise a supported ID token signing algorithm",
@@ -181,12 +248,13 @@ pub(crate) async fn verify_id_token(
     validation.required_spec_claims.insert("exp".to_string());
     validation.required_spec_claims.insert("sub".to_string());
 
-    let token = decode::<OidcIdTokenClaims>(raw_id_token, &decoding_key, &validation).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("failed to verify ID token: {err}"),
-        )
-    })?;
+    let token =
+        decode::<OidcIdTokenClaims>(raw_id_token, &decoding_key, &validation).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("failed to verify ID token: {err}"),
+            )
+        })?;
     let claims = token.claims;
     validate_claims(&claims, client_id, expected_nonce)?;
 
@@ -374,7 +442,12 @@ mod tests {
         assert_eq!(verified.claims.iss, discovery.issuer);
         assert!(verified.claims.exp > 0);
         assert!(verified.claims.nbf.is_none());
-        assert!(verified.claims.extra.contains_key("https://api.openai.com/auth"));
+        assert!(
+            verified
+                .claims
+                .extra
+                .contains_key("https://api.openai.com/auth")
+        );
     }
 
     #[tokio::test]
@@ -408,7 +481,8 @@ mod tests {
         let server = MockServer::start().await;
         mount_jwks(&server).await;
         let discovery = discovery(&server);
-        let token = signed_id_token(&discovery.issuer, json!(CLIENT_ID), None).expect("signed token");
+        let token =
+            signed_id_token(&discovery.issuer, json!(CLIENT_ID), None).expect("signed token");
 
         verify_id_token(&token, &discovery, CLIENT_ID, Some(NONCE))
             .await

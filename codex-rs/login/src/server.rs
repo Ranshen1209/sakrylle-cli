@@ -17,32 +17,61 @@ use std::io::Write;
 use std::io::{self};
 use std::net::SocketAddr;
 use std::net::TcpStream;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
 use crate::auth::AuthDotJson;
-use crate::auth::load_auth_dot_json;
-use crate::auth::revoke_auth_tokens;
+use crate::auth::AuthKeyringBackendKind;
+use crate::auth::WorkspaceLogin;
 use crate::auth::save_auth;
-use crate::auth::should_revoke_auth_tokens;
+use crate::callback_params::LIFE_SCIENCES_OAUTH_STATE_SUFFIX;
+use crate::callback_params::LoginCallbackResult;
+use crate::callback_params::LoginOnboardingEntrypoint;
+use crate::default_client::originator;
+use crate::oauth::AuthorizationCodeGrant;
+use crate::oauth::AuthorizationRequest;
+use crate::oauth::CallbackError;
+use crate::oauth::CallbackParameters;
+use crate::oauth::ErrorBodyLimit;
+use crate::oauth::OAuthClient;
+use crate::oauth::OAuthError;
+use crate::oauth::TokenEncoding;
+use crate::oauth::TokenEndpoint;
+use crate::oauth::build_authorization_url;
+use crate::oauth::generate_state;
+use crate::oauth::sanitize_url_for_logging;
+use crate::oidc::OidcDiscovery;
+use crate::oidc::SAKRYLLE_SCOPE;
+use crate::oidc::fetch_discovery;
+use crate::oidc::is_sakrylle_issuer;
+use crate::oidc::resolve_issuer;
 use crate::oidc::validate_discovery;
 use crate::oidc::verify_id_token;
+use crate::outbound_proxy::AuthRouteConfig;
 use crate::pkce::PkceCodes;
 use crate::pkce::generate_pkce;
+use crate::success_page::LoginSuccessPage;
+use crate::success_page::LoginSuccessRedirect;
+use crate::success_page::compose_success_url;
+use crate::success_page::jwt_auth_claims;
+use crate::token_data::AccountOAuthProvenance;
 use crate::token_data::TokenData;
 use crate::token_data::parse_chatgpt_jwt_claims;
-use base64::Engine;
 use chrono::Utc;
-use codex_app_server_protocol::AuthMode;
-use codex_client::build_reqwest_client_with_custom_ca;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpClientBuilder;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_otel::auth_storage::AuthStorageOriginator;
+use codex_protocol::auth::AuthMode;
 use codex_utils_template::Template;
-use rand::RngCore;
-use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tiny_http::Header;
 use tiny_http::Request;
@@ -53,57 +82,11 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
-// SAKRYLLE: OIDC login — changed issuer and port strategy
-const DEFAULT_ISSUER: &str = "https://sub.sakrylle.com";
-const SAKRYLLE_OIDC_ISSUER_ENV: &str = "SAKRYLLE_OIDC_ISSUER";
-const LOGIN_TIMEOUT_SECS: u64 = 300;
-const SAKRYLLE_CLIENT_ID: &str = "sakrylle-cli";
-pub(crate) const SAKRYLLE_SCOPE: &str =
-    "openid profile email models:read responses:create messages:create usage:read offline_access";
-// SAKRYLLE: OIDC login — removed DEFAULT_PORT/FALLBACK_PORT in favour of random port (127.0.0.1:0)
-
-/// SAKRYLLE: OIDC login — OpenID Connect discovery document.
-#[derive(Debug, Clone, Deserialize)]
-pub struct OidcDiscovery {
-    pub issuer: String,
-    pub authorization_endpoint: String,
-    pub token_endpoint: String,
-    #[serde(default)]
-    pub userinfo_endpoint: Option<String>,
-    pub jwks_uri: String,
-    #[serde(default)]
-    pub device_authorization_endpoint: Option<String>,
-    #[serde(default)]
-    pub end_session_endpoint: Option<String>,
-    #[serde(default)]
-    pub code_challenge_methods_supported: Option<Vec<String>>,
-    #[serde(default)]
-    pub id_token_signing_alg_values_supported: Option<Vec<String>>,
-}
-
-/// SAKRYLLE: OIDC login — fetch the OpenID Connect discovery document.
-pub async fn fetch_discovery(issuer: &str) -> io::Result<OidcDiscovery> {
-    let issuer = issuer.trim_end_matches('/');
-    let url = format!("{issuer}/.well-known/openid-configuration");
-    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
-    let resp = client.get(&url).send().await.map_err(io::Error::other)?;
-    if !resp.status().is_success() {
-        return Err(io::Error::other(format!(
-            "OIDC discovery failed with status {}",
-            resp.status()
-        )));
-    }
-    resp.json::<OidcDiscovery>()
-        .await
-        .map_err(|e| io::Error::other(format!("failed to parse OIDC discovery: {e}")))
-}
-
-/// SAKRYLLE: OIDC login — resolve the issuer from env or default.
-pub fn resolve_issuer() -> String {
-    std::env::var(SAKRYLLE_OIDC_ISSUER_ENV).unwrap_or_else(|_| DEFAULT_ISSUER.to_string())
-}
-
-/// SAKRYLLE: OIDC login — use Sakrylle-branded error page
+/// OpenAI issuer used by the upstream success-page platform URL selection.
+pub(super) const DEFAULT_ISSUER: &str = "https://auth.openai.com";
+const DEFAULT_PORT: u16 = 1455;
+// Keep in sync with the Codex CLI Hydra redirect URI allow-list.
+const FALLBACK_PORT: u16 = 1457;
 static LOGIN_ERROR_PAGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     Template::parse(include_str!("assets/sakrylle_error.html"))
         .unwrap_or_else(|err| panic!("login error page template must parse: {err}"))
@@ -118,46 +101,41 @@ pub struct ServerOptions {
     pub port: u16,
     pub open_browser: bool,
     pub force_state: Option<String>,
+    pub workspace_login: Option<WorkspaceLogin>,
     pub forced_chatgpt_workspace_id: Option<Vec<String>>,
     pub codex_streamlined_login: bool,
+    pub login_success_page: LoginSuccessPage,
     pub cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
+    pub auth_keyring_backend_kind: AuthKeyringBackendKind,
+    pub auth_route_config: AuthRouteConfig,
 }
 
 impl ServerOptions {
-    /// SAKRYLLE: OIDC login — creates a server configuration with the Sakrylle issuer and random port.
+    /// Creates a server configuration with the default issuer and port.
     pub fn new(
         codex_home: PathBuf,
         client_id: String,
         forced_chatgpt_workspace_id: Option<Vec<String>>,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
+        auth_keyring_backend_kind: AuthKeyringBackendKind,
+        auth_route_config: AuthRouteConfig,
     ) -> Self {
         Self {
             codex_home,
             client_id,
-            // SAKRYLLE: OIDC login — issuer from env or default
+            // SAKRYLLE: OIDC issuer from SAKRYLLE_OIDC_ISSUER or https://sub.sakrylle.com.
             issuer: resolve_issuer(),
-            // SAKRYLLE: OIDC login — port 0 means OS assigns a random free port
-            port: 0,
+            port: DEFAULT_PORT,
             open_browser: true,
             force_state: None,
+            workspace_login: None,
             forced_chatgpt_workspace_id,
             codex_streamlined_login: false,
+            login_success_page: LoginSuccessPage::default(),
             cli_auth_credentials_store_mode,
+            auth_keyring_backend_kind,
+            auth_route_config,
         }
-    }
-
-    /// SAKRYLLE: OIDC login — creates a server configuration with the Sakrylle client_id and scope.
-    pub fn new_sakrylle(
-        codex_home: PathBuf,
-        forced_chatgpt_workspace_id: Option<Vec<String>>,
-        cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
-    ) -> Self {
-        Self::new(
-            codex_home,
-            SAKRYLLE_CLIENT_ID.to_string(),
-            forced_chatgpt_workspace_id,
-            cli_auth_credentials_store_mode,
-        )
     }
 }
 
@@ -165,13 +143,20 @@ impl ServerOptions {
 pub struct LoginServer {
     pub auth_url: String,
     pub actual_port: u16,
-    server_handle: tokio::task::JoinHandle<io::Result<()>>,
+    server_handle: tokio::task::JoinHandle<io::Result<LoginCallbackResult>>,
     shutdown_handle: ShutdownHandle,
 }
 
 impl LoginServer {
     /// Waits for the login callback loop to finish.
     pub async fn block_until_done(self) -> io::Result<()> {
+        self.block_until_done_with_callback_result()
+            .await
+            .map(|_| ())
+    }
+
+    /// Waits for login to finish and returns allowlisted callback metadata.
+    pub async fn block_until_done_with_callback_result(self) -> io::Result<LoginCallbackResult> {
         self.server_handle
             .await
             .map_err(|err| io::Error::other(format!("login server thread panicked: {err:?}")))?
@@ -201,21 +186,35 @@ impl ShutdownHandle {
     }
 }
 
-/// SAKRYLLE: OIDC login — starts a local callback server and returns the browser auth URL.
-/// Uses OIDC discovery to obtain the authorization endpoint.
+/// Starts a local callback server and returns the browser auth URL.
+///
+/// Sakrylle issuers fetch the OIDC discovery document first, bind an ephemeral
+/// loopback port, and redirect to `/callback`. Other issuers keep the upstream
+/// fixed-port `/auth/callback` flow.
 pub async fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
-    let issuer = &opts.issuer;
-    // SAKRYLLE: OIDC login — fetch discovery document for endpoint URLs
-    let discovery = fetch_discovery(issuer).await?;
-    validate_discovery(&discovery, issuer, /*require_device_endpoint*/ false)?;
-    let auth_endpoint = &discovery.authorization_endpoint;
-
+    let sakrylle = is_sakrylle_issuer(&opts.issuer);
+    let discovery = if sakrylle {
+        let discovery = fetch_discovery(&opts.issuer).await?;
+        validate_discovery(
+            &discovery,
+            &opts.issuer,
+            /*require_device_endpoint*/ false,
+        )?;
+        Some(discovery)
+    } else {
+        None
+    };
     let pkce = generate_pkce();
     let state = opts.force_state.clone().unwrap_or_else(generate_state);
-    let nonce = generate_nonce();
+    let nonce = if sakrylle {
+        Some(generate_nonce())
+    } else {
+        None
+    };
 
-    // SAKRYLLE: OIDC login — bind to 127.0.0.1:0 for a random free port
-    let server = bind_server(0)?;
+    // SAKRYLLE: port 0 lets the OS assign a free loopback port for PKCE.
+    let bind_port = if sakrylle { 0 } else { opts.port };
+    let server = bind_server(bind_port)?;
     let actual_port = match server.server_addr().to_ip() {
         Some(addr) => addr.port(),
         None => {
@@ -227,21 +226,30 @@ pub async fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     };
     let server = Arc::new(server);
 
-    // SAKRYLLE: OIDC login — use /callback path per sub2api
-    let redirect_uri = format!("http://127.0.0.1:{actual_port}/callback");
+    let redirect_path = if sakrylle {
+        "/callback"
+    } else {
+        "/auth/callback"
+    };
+    let redirect_uri = format!("http://127.0.0.1:{actual_port}{redirect_path}");
+    let authorization_endpoint = discovery.as_ref().map_or_else(
+        || format!("{}/oauth/authorize", opts.issuer.trim_end_matches('/')),
+        |discovery| discovery.authorization_endpoint.clone(),
+    );
     let auth_url = build_authorize_url(
-        auth_endpoint,
+        &authorization_endpoint,
+        &opts.issuer,
         &opts.client_id,
         &redirect_uri,
         &pkce,
         &state,
-        &nonce,
+        nonce.as_deref(),
         opts.forced_chatgpt_workspace_id.as_deref(),
-    );
+        opts.workspace_login.as_ref(),
+    )?;
 
-    // SAKRYLLE: OIDC login — cross-platform browser open with URL fallback
     if opts.open_browser {
-        open_browser_with_fallback(&auth_url);
+        let _ = webbrowser::open(&auth_url);
     }
 
     // Map blocking reads from server.recv() to an async channel.
@@ -267,23 +275,11 @@ pub async fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         let shutdown_notify = shutdown_notify.clone();
         let server = server;
         let discovery = discovery.clone();
-        let opts = opts.clone();
-        let redirect_uri = redirect_uri.clone();
-        let pkce = pkce.clone();
         let nonce = nonce.clone();
-        tokio::spawn(async move {
-            // SAKRYLLE: OIDC login — 300-second login timeout
-            let timeout = tokio::time::sleep(Duration::from_secs(LOGIN_TIMEOUT_SECS));
-            tokio::pin!(timeout);
-
+        let task = async move {
+            let mut callback_result = LoginCallbackResult::default();
             let result = loop {
                 tokio::select! {
-                    _ = &mut timeout => {
-                        break Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("Login timed out after {LOGIN_TIMEOUT_SECS} seconds"),
-                        ));
-                    }
                     _ = shutdown_notify.notified() => {
                         break Err(io::Error::other("Login was not completed"));
                     }
@@ -294,11 +290,27 @@ pub async fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
 
                         let url_raw = req.url().to_string();
                         let response =
-                            process_request(&url_raw, &opts, &redirect_uri, &pkce, actual_port, &state, &nonce, &discovery).await;
+                            process_request(
+                                &url_raw,
+                                &opts,
+                                &redirect_uri,
+                                &pkce,
+                                actual_port,
+                                &state,
+                                discovery.as_ref(),
+                                nonce.as_deref(),
+                            )
+                            .await;
 
                         let exit_result = match response {
                             HandledRequest::Response(response) => {
                                 let _ = tokio::task::spawn_blocking(move || req.respond(response)).await;
+                                None
+                            }
+                            HandledRequest::RedirectWithHeader { header, result } => {
+                                callback_result = result;
+                                let redirect = Response::empty(302).with_header(header);
+                                let _ = tokio::task::spawn_blocking(move || req.respond(redirect)).await;
                                 None
                             }
                             HandledRequest::ResponseAndExit {
@@ -307,15 +319,36 @@ pub async fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                 result,
                             } => {
                                 let _ = tokio::task::spawn_blocking(move || {
-                                    send_response_with_disconnect(req, headers, body)
+                                    send_response_with_disconnect(
+                                        req,
+                                        StatusCode(200),
+                                        headers,
+                                        body,
+                                    )
                                 })
                                 .await;
-                                Some(result)
+                                Some(result.map(|()| callback_result))
                             }
-                            HandledRequest::RedirectWithHeader(header) => {
-                                let redirect = Response::empty(302).with_header(header);
-                                let _ = tokio::task::spawn_blocking(move || req.respond(redirect)).await;
-                                None
+                            HandledRequest::RedirectAndExit { header, result } => {
+                                match tokio::task::spawn_blocking(move || {
+                                    send_response_with_disconnect(
+                                        req,
+                                        StatusCode(302),
+                                        vec![header],
+                                        Vec::new(),
+                                    )
+                                })
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(err)) => {
+                                        warn!("failed to send hosted login redirect: {err}");
+                                    }
+                                    Err(err) => {
+                                        warn!("hosted login redirect task failed: {err}");
+                                    }
+                                }
+                                Some(Ok(result))
                             }
                         };
 
@@ -330,7 +363,8 @@ pub async fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
             // running `server.recv()` in a loop exits cleanly.
             server.unblock();
             result
-        })
+        };
+        tokio::spawn(AuthStorageOriginator::current().scope(task))
     };
 
     Ok(LoginServer {
@@ -344,7 +378,14 @@ pub async fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
 /// Internal callback handling outcome.
 enum HandledRequest {
     Response(Response<Cursor<Vec<u8>>>),
-    RedirectWithHeader(Header),
+    RedirectWithHeader {
+        header: Header,
+        result: LoginCallbackResult,
+    },
+    RedirectAndExit {
+        header: Header,
+        result: LoginCallbackResult,
+    },
     ResponseAndExit {
         headers: Vec<Header>,
         body: Vec<u8>,
@@ -359,8 +400,8 @@ async fn process_request(
     pkce: &PkceCodes,
     actual_port: u16,
     state: &str,
-    nonce: &str,
-    discovery: &OidcDiscovery,
+    discovery: Option<&OidcDiscovery>,
+    nonce: Option<&str>,
 ) -> HandledRequest {
     let parsed_url = match url::Url::parse(&format!("http://localhost{url_raw}")) {
         Ok(u) => u,
@@ -374,58 +415,52 @@ async fn process_request(
     let path = parsed_url.path().to_string();
 
     match path.as_str() {
-        // SAKRYLLE: OIDC login — accept both /callback (sub2api) and /auth/callback (legacy)
+        // SAKRYLLE: accept `/callback` (sub2api) and the upstream `/auth/callback` path.
         "/callback" | "/auth/callback" => {
-            let params: std::collections::HashMap<String, String> =
-                parsed_url.query_pairs().into_owned().collect();
-            let has_code = params.get("code").is_some_and(|code| !code.is_empty());
-            let has_state = params.get("state").is_some_and(|state| !state.is_empty());
-            let has_error = params.get("error").is_some_and(|error| !error.is_empty());
-            let state_valid = params.get("state").map(String::as_str) == Some(state);
-            info!(
-                path = %path,
-                has_code,
-                has_state,
-                has_error,
-                state_valid,
-                "received login callback"
-            );
-            if !state_valid {
-                warn!(
-                    path = %path,
-                    has_code,
-                    has_state,
-                    has_error,
-                    "login callback state mismatch"
-                );
-                return HandledRequest::Response(
-                    Response::from_string("State mismatch").with_status_code(400),
-                );
+            let mut params = CallbackParameters::from_url(&parsed_url);
+            let mut callback_result = LoginCallbackResult::default();
+            // ChatGPT may append onboarding metadata to the otherwise exact callback state.
+            if let Some(callback_state) = params.state.as_mut()
+                && callback_state.strip_suffix(LIFE_SCIENCES_OAUTH_STATE_SUFFIX) == Some(state)
+            {
+                callback_state.truncate(state.len());
+                callback_result.onboarding_entrypoint =
+                    Some(LoginOnboardingEntrypoint::LifeSciences);
             }
-            if let Some(error_code) = params.get("error") {
-                let error_description = params.get("error_description").map(String::as_str);
-                let message = oauth_callback_error_message(error_code, error_description);
-                let safe_error_description = if is_missing_codex_entitlement_error(error_code, error_description) {
-                    None
-                } else {
-                    error_description
-                };
-                eprintln!("OAuth callback error: {message}");
-                warn!(
-                    error_code,
-                    has_error_description = error_description.is_some_and(|s| !s.trim().is_empty()),
-                    "oauth callback returned error"
-                );
-                return login_error_response(
-                    &message,
-                    io::ErrorKind::PermissionDenied,
-                    Some(error_code),
-                    safe_error_description,
-                );
-            }
-            let code = match params.get("code") {
-                Some(c) if !c.is_empty() => c.clone(),
-                _ => {
+            let validation = params.validate(state);
+            let has_code = params.code.as_ref().is_some_and(|code| !code.is_empty());
+            let has_state = params.state.as_ref().is_some_and(|state| !state.is_empty());
+            let has_error = params.error.as_ref().is_some_and(|error| !error.is_empty());
+            let state_valid = !matches!(validation, Err(CallbackError::StateMismatch));
+            info!(%path, has_code, has_state, has_error, state_valid, "received login callback");
+            let code = match validation {
+                Ok(code) => code,
+                Err(CallbackError::StateMismatch) => {
+                    warn!(%path, has_code, has_state, has_error, "login callback state mismatch");
+                    return HandledRequest::Response(
+                        Response::from_string("State mismatch").with_status_code(400),
+                    );
+                }
+                Err(CallbackError::Provider {
+                    code: error_code,
+                    description: error_description,
+                }) => {
+                    let message = oauth_callback_error_message(error_code, error_description);
+                    eprintln!("OAuth callback error: {message}");
+                    warn!(
+                        error_code,
+                        has_error_description =
+                            error_description.is_some_and(|s| !s.trim().is_empty()),
+                        "oauth callback returned error"
+                    );
+                    return login_error_response(
+                        &message,
+                        io::ErrorKind::PermissionDenied,
+                        Some(error_code),
+                        error_description,
+                    );
+                }
+                Err(CallbackError::MissingCode) => {
                     return login_error_response(
                         "Missing authorization code. Sign-in could not be completed.",
                         io::ErrorKind::InvalidData,
@@ -435,73 +470,91 @@ async fn process_request(
                 }
             };
 
-            // SAKRYLLE: OIDC login — use discovery token_endpoint
-            match exchange_code_for_tokens(&discovery.token_endpoint, &opts.client_id, redirect_uri, pkce, &code)
-                .await
+            match exchange_code_for_tokens(
+                &opts.issuer,
+                &opts.client_id,
+                redirect_uri,
+                pkce,
+                code,
+                &opts.auth_route_config,
+                discovery.map(|discovery| discovery.token_endpoint.as_str()),
+            )
+            .await
             {
-                Ok(tokens) => match verify_id_token(
-                    &tokens.id_token,
-                    discovery,
-                    &opts.client_id,
-                    Some(nonce),
-                )
-                .await
-                {
-                    Ok(verified_id_token) => {
-                        if let Err(message) = ensure_workspace_allowed(
-                            opts.forced_chatgpt_workspace_id.as_deref(),
-                            &verified_id_token.raw,
-                        ) {
-                            eprintln!("Workspace restriction error: {message}");
-                            return login_error_response(
-                                &message,
-                                io::ErrorKind::PermissionDenied,
-                                Some("workspace_restriction"),
-                                /*error_description*/ None,
-                            );
-                        }
-                        // SAKRYLLE: OIDC login — persist tokens only after strict ID token validation.
-                        if let Err(err) = persist_tokens_async(
-                            &opts.codex_home,
-                            /*api_key*/ None,
-                            verified_id_token.raw.clone(),
-                            tokens.access_token.clone(),
-                            tokens.refresh_token.clone(),
-                            opts.cli_auth_credentials_store_mode,
-                        )
-                        .await
+                Ok((mut tokens, client)) => {
+                    if let Some(discovery) = discovery {
+                        match verify_id_token(&tokens.id_token, discovery, &opts.client_id, nonce)
+                            .await
                         {
-                            eprintln!("Persist error: {err}");
-                            return login_error_response(
-                                "Sign-in completed but credentials could not be saved locally.",
-                                io::ErrorKind::Other,
-                                Some("persist_failed"),
-                                Some(&err.to_string()),
-                            );
-                        }
-
-                        // SAKRYLLE: OIDC login — redirect to local success page
-                        let success_url = format!("http://127.0.0.1:{actual_port}/success");
-                        match tiny_http::Header::from_bytes(&b"Location"[..], success_url.as_bytes()) {
-                            Ok(header) => HandledRequest::RedirectWithHeader(header),
-                            Err(_) => login_error_response(
-                                "Sign-in completed but redirecting back to the app failed.",
-                                io::ErrorKind::Other,
-                                Some("redirect_failed"),
-                                /*error_description*/ None,
-                            ),
+                            Ok(verified) => tokens.id_token = verified.raw,
+                            Err(err) => {
+                                eprintln!("ID token verification failed: {err}");
+                                return login_error_response(
+                                    "Sign-in could not be completed because the ID token failed validation.",
+                                    io::ErrorKind::PermissionDenied,
+                                    Some("id_token_invalid"),
+                                    Some(&err.to_string()),
+                                );
+                            }
                         }
                     }
-                    Err(err) => {
-                        eprintln!("ID token validation error: {err}");
-                        login_error_response(
-                            &format!("ID token validation failed: {err}"),
+                    if let Err(message) = ensure_workspace_allowed(
+                        opts.forced_chatgpt_workspace_id.as_deref(),
+                        &tokens.id_token,
+                    ) {
+                        eprintln!("Workspace restriction error: {message}");
+                        return login_error_response(
+                            &message,
                             io::ErrorKind::PermissionDenied,
-                            Some("id_token_validation_failed"),
+                            Some("workspace_restriction"),
                             /*error_description*/ None,
-                        )
+                        );
                     }
-                },
+                    // Obtain API key via token-exchange and persist
+                    let api_key =
+                        obtain_api_key(&client, &opts.issuer, &opts.client_id, &tokens.id_token)
+                            .await
+                            .ok();
+                    if let Err(err) = persist_tokens_async(opts, api_key.clone(), &tokens).await {
+                        eprintln!("Persist error: {err}");
+                        return login_error_response(
+                            "Sign-in completed but credentials could not be saved locally.",
+                            io::ErrorKind::Other,
+                            Some("persist_failed"),
+                            Some(&err.to_string()),
+                        );
+                    }
+
+                    let redirect = compose_success_url(
+                        actual_port,
+                        &opts.issuer,
+                        &tokens.id_token,
+                        &tokens.access_token,
+                        opts.codex_streamlined_login,
+                        &opts.login_success_page,
+                    );
+                    let url = match &redirect {
+                        LoginSuccessRedirect::Local(url) | LoginSuccessRedirect::Hosted(url) => url,
+                    };
+                    match tiny_http::Header::from_bytes(&b"Location"[..], url.as_bytes()) {
+                        Ok(header) => match redirect {
+                            LoginSuccessRedirect::Local(_) => HandledRequest::RedirectWithHeader {
+                                header,
+                                result: callback_result,
+                            },
+                            LoginSuccessRedirect::Hosted(_) => HandledRequest::RedirectAndExit {
+                                header,
+                                result: callback_result,
+                            },
+                        },
+                        Err(_) => login_error_response(
+                            "Sign-in completed but redirecting back to Sakrylle failed.",
+                            io::ErrorKind::Other,
+                            Some("redirect_failed"),
+                            /*error_description*/ None,
+                        ),
+                    }
+                }
                 Err(err) => {
                     eprintln!("Token exchange error: {err}");
                     error!("login callback token exchange failed");
@@ -515,7 +568,7 @@ async fn process_request(
             }
         }
         "/success" => {
-            // SAKRYLLE: OIDC login — Sakrylle-branded success page
+            // SAKRYLLE: branded success page for both streamlined and legacy callbacks.
             let body = include_str!("assets/sakrylle_success.html");
             HandledRequest::ResponseAndExit {
                 headers: match Header::from_bytes(
@@ -552,10 +605,10 @@ async fn process_request(
 /// server-side connection persistence, but it does not.
 fn send_response_with_disconnect(
     req: Request,
+    status: StatusCode,
     mut headers: Vec<Header>,
     body: Vec<u8>,
 ) -> io::Result<()> {
-    let status = StatusCode(200);
     let mut writer = req.into_writer();
     let reason = status.default_reason_phrase();
     write!(writer, "HTTP/1.1 {} {}\r\n", status.0, reason)?;
@@ -585,92 +638,74 @@ fn send_response_with_disconnect(
     writer.flush()
 }
 
-/// SAKRYLLE: OIDC login — build the authorization URL using the discovery authorization_endpoint.
 fn build_authorize_url(
-    authorization_endpoint: &str,
+    endpoint: &str,
+    issuer: &str,
     client_id: &str,
     redirect_uri: &str,
     pkce: &PkceCodes,
     state: &str,
-    nonce: &str,
-    forced_chatgpt_workspace_id: Option<&[String]>,
-) -> String {
-    // SAKRYLLE: OIDC login — aud as single-element array for sub2api
-    let aud_json = serde_json::to_string(&[client_id]).unwrap_or_else(|_| format!("[\"{client_id}\"]"));
-    let mut query = vec![
-        ("response_type".to_string(), "code".to_string()),
-        ("client_id".to_string(), client_id.to_string()),
-        ("redirect_uri".to_string(), redirect_uri.to_string()),
-        ("scope".to_string(), SAKRYLLE_SCOPE.to_string()),
-        (
-            "code_challenge".to_string(),
-            pkce.code_challenge.to_string(),
-        ),
-        ("code_challenge_method".to_string(), "S256".to_string()),
-        ("state".to_string(), state.to_string()),
-        ("nonce".to_string(), nonce.to_string()),
-        ("aud".to_string(), aud_json),
-    ];
-    if let Some(workspace_ids) = forced_chatgpt_workspace_id
-        && !workspace_ids.is_empty()
-    {
-        query.push(("allowed_workspace_id".to_string(), workspace_ids.join(",")));
-    }
-    let qs = query
-        .into_iter()
-        .map(|(k, v)| format!("{k}={}", urlencoding::encode(&v)))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("{authorization_endpoint}?{qs}")
-}
-
-/// SAKRYLLE: OIDC login — cross-platform browser open with fallback.
-/// Tries `open` (macOS), `xdg-open` (Linux), `start` (Windows), then `webbrowser` crate.
-/// If all fail, prints the URL so the user can open it manually.
-fn open_browser_with_fallback(url: &str) {
-    // Try platform-specific commands first
-    let result = if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(url).status()
-    } else if cfg!(target_os = "linux") {
-        std::process::Command::new("xdg-open").arg(url).status()
-    } else if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", url])
-            .status()
+    nonce: Option<&str>,
+    forced_chatgpt_workspace_ids: Option<&[String]>,
+    workspace_login: Option<&WorkspaceLogin>,
+) -> io::Result<String> {
+    let sakrylle = is_sakrylle_issuer(issuer);
+    let originator = originator().value;
+    let workspace_ids = forced_chatgpt_workspace_ids.map(|ids| ids.join(","));
+    let aud_json =
+        serde_json::to_string(&[client_id]).unwrap_or_else(|_| format!("[\"{client_id}\"]"));
+    let mut extra_parameters = if sakrylle {
+        Vec::new()
     } else {
-        // Fall back to webbrowser crate
-        return if webbrowser::open(url).is_ok() {
-            info!("opened browser for login");
-        } else {
-            eprintln!("Could not open browser automatically. Please open this URL manually:\n\n{url}\n");
-        };
+        vec![
+            ("id_token_add_organizations", "true"),
+            ("codex_cli_simplified_flow", "true"),
+            ("originator", originator.as_str()),
+        ]
     };
-
-    match result {
-        Ok(status) if status.success() => {
-            info!("opened browser for login");
+    if sakrylle {
+        if let Some(nonce) = nonce {
+            extra_parameters.push(("nonce", nonce));
         }
-        _ => {
-            // Try webbrowser crate as second fallback
-            if webbrowser::open(url).is_err() {
-                eprintln!("Could not open browser automatically. Please open this URL manually:\n\n{url}\n");
-            }
+        // SAKRYLLE: sub2api expects `aud` as a single-element JSON array.
+        extra_parameters.push(("aud", aud_json.as_str()));
+    }
+    if let Some(workspace_ids) = workspace_ids.as_deref() {
+        extra_parameters.push(("allowed_workspace_id", workspace_ids));
+    }
+    if let Some(login) = workspace_login {
+        extra_parameters.push(("current_workspace_id", &login.workspace_id));
+        if let Some(email) = &login.email {
+            extra_parameters.push(("login_hint", email));
+        }
+        if let Some(connection) = &login.connection {
+            extra_parameters.push(("connection", connection));
         }
     }
-}
-
-fn generate_state() -> String {
-    random_urlsafe_token()
+    let scope = if sakrylle {
+        SAKRYLLE_SCOPE
+    } else {
+        "openid profile email offline_access api.connectors.read api.connectors.invoke"
+    };
+    build_authorization_url(AuthorizationRequest {
+        endpoint,
+        client_id,
+        redirect_uri,
+        scope: Some(scope),
+        resource: None,
+        pkce,
+        state,
+        extra_parameters: &extra_parameters,
+    })
+    .map(String::from)
+    .map_err(io::Error::other)
 }
 
 fn generate_nonce() -> String {
-    random_urlsafe_token()
-}
-
-fn random_urlsafe_token() -> String {
+    use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &bytes)
 }
 
 fn send_cancel_request(port: u16) -> io::Result<()> {
@@ -690,364 +725,265 @@ fn send_cancel_request(port: u16) -> io::Result<()> {
     Ok(())
 }
 
-/// SAKRYLLE: OIDC login — bind to the given port. Port 0 lets the OS assign a random free port.
 fn bind_server(port: u16) -> io::Result<Server> {
-    let bind_address = format!("127.0.0.1:{port}");
+    let preferred_bind_address = format!("127.0.0.1:{port}");
+    let fallback_bind_address = format!("127.0.0.1:{FALLBACK_PORT}");
+    let mut bind_address = preferred_bind_address.clone();
+    let mut cancel_attempted = false;
+    let mut attempts = 0;
+    let mut using_fallback_port = false;
+    const MAX_ATTEMPTS: u32 = 10;
+    const RETRY_DELAY: Duration = Duration::from_millis(200);
 
-    // SAKRYLLE: OIDC login — for random port (0), just bind once; no retry/fallback needed
-    match Server::http(&bind_address) {
-        Ok(server) => return Ok(server),
-        Err(err) => {
-            // If port was 0 (random), the OS should always find a free port — failure is fatal.
-            if port == 0 {
-                return Err(io::Error::other(format!(
-                    "Failed to bind to {bind_address}: {err}"
-                )));
-            }
+    loop {
+        match Server::http(&bind_address) {
+            Ok(server) => return Ok(server),
+            Err(err) => {
+                attempts += 1;
+                let is_addr_in_use = err
+                    .downcast_ref::<io::Error>()
+                    .map(|io_err| io_err.kind() == io::ErrorKind::AddrInUse)
+                    .unwrap_or(false);
 
-            let is_addr_in_use = err
-                .downcast_ref::<io::Error>()
-                .map(|io_err| io_err.kind() == io::ErrorKind::AddrInUse)
-                .unwrap_or(false);
+                // If the address is in use, there may be another instance of the login server
+                // running. Attempt to cancel it and retry before falling back.
+                if is_addr_in_use {
+                    if !cancel_attempted && !using_fallback_port {
+                        cancel_attempted = true;
+                        if let Err(cancel_err) = send_cancel_request(port) {
+                            eprintln!("Failed to cancel previous login server: {cancel_err}");
+                        }
+                    }
 
-            if is_addr_in_use {
-                // Attempt to cancel any existing login server on this port
-                if let Err(cancel_err) = send_cancel_request(port) {
-                    eprintln!("Failed to cancel previous login server: {cancel_err}");
+                    thread::sleep(RETRY_DELAY);
+
+                    if attempts >= MAX_ATTEMPTS {
+                        if port == DEFAULT_PORT && !using_fallback_port {
+                            warn!(
+                                %preferred_bind_address,
+                                %fallback_bind_address,
+                                "default login callback port is unavailable; falling back to the registered fallback port"
+                            );
+                            bind_address = fallback_bind_address.clone();
+                            attempts = 0;
+                            using_fallback_port = true;
+                            continue;
+                        }
+
+                        return Err(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            format!("Port {bind_address} is already in use"),
+                        ));
+                    }
+
+                    continue;
                 }
-                thread::sleep(Duration::from_millis(200));
-                // Retry once
-                return Server::http(&bind_address).map_err(io::Error::other);
-            }
 
-            Err(io::Error::other(err))
+                return Err(io::Error::other(err));
+            }
         }
     }
 }
 
 /// Tokens returned by the OAuth authorization-code exchange.
+#[derive(serde::Deserialize)]
 pub(crate) struct ExchangedTokens {
     pub id_token: String,
     pub access_token: String,
     pub refresh_token: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TokenEndpointErrorDetail {
-    error_code: Option<String>,
-    error_message: Option<String>,
-    display_message: String,
-}
-
-impl std::fmt::Display for TokenEndpointErrorDetail {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.display_message.fmt(f)
-    }
-}
-
-const REDACTED_URL_VALUE: &str = "<redacted>";
-const SENSITIVE_URL_QUERY_KEYS: &[&str] = &[
-    "access_token",
-    "api_key",
-    "client_secret",
-    "code",
-    "code_verifier",
-    "id_token",
-    "key",
-    "refresh_token",
-    "requested_token",
-    "state",
-    "subject_token",
-    "token",
-];
-
-fn redact_sensitive_query_value(key: &str, value: &str) -> String {
-    if SENSITIVE_URL_QUERY_KEYS
-        .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(key))
-    {
-        REDACTED_URL_VALUE.to_string()
-    } else {
-        value.to_string()
-    }
-}
-
-/// Redacts URL components that commonly carry auth secrets while preserving the host/path shape.
-///
-/// This keeps developer-facing logs useful for debugging transport failures without persisting
-/// tokens, callback codes, fragments, or embedded credentials.
-fn redact_sensitive_url_parts(url: &mut url::Url) {
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-    url.set_fragment(None);
-
-    let query_pairs = url
-        .query_pairs()
-        .map(|(key, value)| {
-            let key = key.into_owned();
-            let value = value.into_owned();
-            (key.clone(), redact_sensitive_query_value(&key, &value))
-        })
-        .collect::<Vec<_>>();
-
-    if query_pairs.is_empty() {
-        url.set_query(None);
-        return;
-    }
-
-    let redacted_query = query_pairs
-        .into_iter()
-        .fold(
-            url::form_urlencoded::Serializer::new(String::new()),
-            |mut serializer, (key, value)| {
-                serializer.append_pair(&key, &value);
-                serializer
-            },
-        )
-        .finish();
-    url.set_query(Some(&redacted_query));
-}
-
-/// Redacts any URL attached to a reqwest transport error before it is logged or returned.
-fn redact_sensitive_error_url(mut err: reqwest::Error) -> reqwest::Error {
-    if let Some(url) = err.url_mut() {
-        redact_sensitive_url_parts(url);
-    }
-    err
-}
-
-/// Sanitizes a free-form URL string for structured logging.
-///
-/// This is used for caller-supplied issuer values, which may contain credentials or query
-/// parameters on non-default deployments.
-fn sanitize_url_for_logging(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut url) => {
-            redact_sensitive_url_parts(&mut url);
-            url.to_string()
-        }
-        Err(_) => "<invalid-url>".to_string(),
-    }
-}
-/// SAKRYLLE: OIDC login — exchanges an authorization code for tokens using the discovery token_endpoint.
+/// Exchanges an authorization code for tokens and returns the client for further token exchanges.
 ///
 /// The returned error remains suitable for user-facing CLI/browser surfaces, so backend-provided
-/// non-JSON error text is preserved there. Structured logging stays narrower: it logs reviewed
-/// fields from parsed token responses and redacted transport errors, but does not log the final
-/// callback-layer `%err` string.
+/// non-JSON error text is preserved there. Structured logs only report status and redacted
+/// transport errors, and do not log the final callback-layer `%err` string.
 pub(crate) async fn exchange_code_for_tokens(
+    issuer: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    pkce: &PkceCodes,
+    code: &str,
+    auth_route_config: &AuthRouteConfig,
+    token_endpoint_override: Option<&str>,
+) -> io::Result<(ExchangedTokens, HttpClient)> {
+    let token_endpoint = token_endpoint_override
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}/oauth/token", issuer.trim_end_matches('/')));
+    let factory = auth_route_config.authentication_factory(&token_endpoint);
+    let allows_fallback = factory.allows_system_proxy_fallback();
+    let redirect_observed = Arc::new(AtomicBool::new(false));
+    let mut builder = HttpClientBuilder::new().without_request_logging();
+    if allows_fallback {
+        // Only bound connection establishment. A response timeout could mean the one-time code
+        // was consumed, so it must never cause another token POST.
+        builder = builder
+            .with_redirect_tracking(Arc::clone(&redirect_observed))
+            .connect_timeout(Duration::from_secs(10));
+    }
+    info!(
+        issuer = %sanitize_url_for_logging(issuer),
+        token_endpoint = %sanitize_url_for_logging(&token_endpoint),
+        %redirect_uri,
+        "starting oauth token exchange"
+    );
+    let (mut client, mut result) = send_code_exchange_request(
+        &factory,
+        builder.clone(),
+        &token_endpoint,
+        client_id,
+        redirect_uri,
+        pkce,
+        code,
+    )
+    .await?;
+    // A redirect means the original POST reached the server and may have consumed the code.
+    if matches!(&result, Err(OAuthError::Transport(error)) if error.is_connect())
+        && allows_fallback
+        && !redirect_observed.load(Ordering::Relaxed)
+    {
+        info!("oauth token connection failed; retrying with system proxy");
+        let factory = factory
+            .clone()
+            .with_outbound_proxy_policy(OutboundProxyPolicy::RespectSystemProxy);
+        (client, result) = send_code_exchange_request(
+            &factory,
+            builder,
+            &token_endpoint,
+            client_id,
+            redirect_uri,
+            pkce,
+            code,
+        )
+        .await?;
+    }
+    match result {
+        Ok(tokens) => {
+            info!("oauth token exchange succeeded");
+            Ok((tokens, client))
+        }
+        Err(OAuthError::Rejected(rejection)) => {
+            if let Some(error) = rejection.body_read_error {
+                return Err(io::Error::other(error));
+            }
+            warn!(
+                status = %rejection.status,
+                "oauth token exchange returned non-success status"
+            );
+            Err(io::Error::other(rejection.to_string()))
+        }
+        Err(OAuthError::Transport(error)) => {
+            error!(
+                is_timeout = error.is_timeout(),
+                is_connect = error.is_connect(),
+                is_request = error.is_request(),
+                %error,
+                "oauth token exchange transport failure"
+            );
+            Err(io::Error::other(error))
+        }
+        Err(error @ OAuthError::InvalidResponse) => Err(io::Error::other(error)),
+    }
+}
+
+async fn send_code_exchange_request(
+    factory: &HttpClientFactory,
+    builder: HttpClientBuilder,
     token_endpoint: &str,
     client_id: &str,
     redirect_uri: &str,
     pkce: &PkceCodes,
     code: &str,
-) -> io::Result<ExchangedTokens> {
-    #[derive(serde::Deserialize)]
-    struct TokenResponse {
-        #[serde(default)]
-        id_token: Option<String>,
-        access_token: String,
-        refresh_token: String,
-    }
-
-    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
-    info!(
-        token_endpoint = %sanitize_url_for_logging(token_endpoint),
-        redirect_uri = %redirect_uri,
-        "starting oauth token exchange"
+) -> io::Result<(HttpClient, Result<ExchangedTokens, OAuthError>)> {
+    let client = builder.build_respecting_outbound_proxy_policy(
+        factory,
+        token_endpoint,
+        ClientRouteClass::Auth,
+    )?;
+    let oauth = OAuthClient::new(
+        &client,
+        TokenEndpoint {
+            url: token_endpoint,
+            client_id,
+            encoding: TokenEncoding::Form,
+            timeout: None,
+            error_body_limit: ErrorBodyLimit::Unlimited,
+        },
     );
-    let resp = client
-        .post(token_endpoint)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
-            urlencoding::encode(code),
-            urlencoding::encode(redirect_uri),
-            urlencoding::encode(client_id),
-            urlencoding::encode(&pkce.code_verifier)
-        ))
-        .send()
+    let result = oauth
+        .exchange_code(AuthorizationCodeGrant {
+            code,
+            redirect_uri,
+            pkce,
+            resource: None,
+        })
         .await;
-    let resp = match resp {
-        Ok(resp) => resp,
-        Err(error) => {
-            let error = redact_sensitive_error_url(error);
-            error!(
-                is_timeout = error.is_timeout(),
-                is_connect = error.is_connect(),
-                is_request = error.is_request(),
-                error = %error,
-                "oauth token exchange transport failure"
-            );
-            return Err(io::Error::other(error));
-        }
-    };
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.map_err(io::Error::other)?;
-        let detail = parse_token_endpoint_error(&body);
-        warn!(
-            %status,
-            error_code = detail.error_code.as_deref().unwrap_or("unknown"),
-            error_message = detail.error_message.as_deref().unwrap_or("unknown"),
-            "oauth token exchange returned non-success status"
-        );
-        return Err(io::Error::other(format!(
-            "token endpoint returned status {status}: {detail}"
-        )));
-    }
-
-    let tokens: TokenResponse = resp.json().await.map_err(io::Error::other)?;
-    info!(%status, "oauth token exchange succeeded");
-    // SAKRYLLE: OIDC login — id_token may be absent; use empty string as fallback
-    Ok(ExchangedTokens {
-        id_token: tokens.id_token.unwrap_or_default(),
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-    })
+    Ok((client, result))
 }
 
-/// Persists exchanged credentials using the configured local auth store, then
-/// best-effort revokes any superseded managed ChatGPT tokens.
+/// Persists exchanged credentials using the configured local auth store.
 pub(crate) async fn persist_tokens_async(
-    codex_home: &Path,
+    opts: &ServerOptions,
     api_key: Option<String>,
-    id_token: String,
-    access_token: String,
-    refresh_token: String,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    exchanged: &ExchangedTokens,
 ) -> io::Result<()> {
     // Reuse existing synchronous logic but run it off the async runtime.
-    let codex_home = codex_home.to_path_buf();
-    let (previous_auth, auth) = tokio::task::spawn_blocking(move || {
-        let previous_auth = match load_auth_dot_json(&codex_home, auth_credentials_store_mode) {
-            Ok(auth) => auth,
-            Err(err) => {
-                warn!("failed to load previous auth before saving new login: {err}");
-                None
-            }
-        };
-        let mut tokens = TokenData {
-            id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
-            access_token,
-            refresh_token,
-            account_id: None,
-        };
-        if let Some(acc) = jwt_auth_claims(&id_token)
-            .get("chatgpt_account_id")
-            .and_then(|v| v.as_str())
-        {
-            tokens.account_id = Some(acc.to_string());
-        }
-        let auth = AuthDotJson {
-            auth_mode: Some(AuthMode::Chatgpt),
-            openai_api_key: api_key,
-            tokens: Some(tokens),
-            last_refresh: Some(Utc::now()),
-            agent_identity: None,
-        };
-        save_auth(&codex_home, &auth, auth_credentials_store_mode)?;
-        Ok::<_, io::Error>((previous_auth, auth))
-    })
-    .await
-    .map_err(|e| io::Error::other(format!("persist task failed: {e}")))??;
-
-    if should_revoke_auth_tokens(previous_auth.as_ref(), &auth)
-        && let Err(err) = revoke_auth_tokens(previous_auth.as_ref()).await
-    {
-        warn!("failed to revoke superseded auth tokens after login: {err}");
-    }
-
-    Ok(())
-}
-
-fn compose_success_url(
-    port: u16,
-    issuer: &str,
-    id_token: &str,
-    access_token: &str,
-    codex_streamlined_login: bool,
-) -> String {
-    let token_claims = jwt_auth_claims(id_token);
-    let access_claims = jwt_auth_claims(access_token);
-
-    let org_id = token_claims
-        .get("organization_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let project_id = token_claims
-        .get("project_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let completed_onboarding = token_claims
-        .get("completed_platform_onboarding")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    let is_org_owner = token_claims
-        .get("is_org_owner")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    let needs_setup = (!completed_onboarding) && is_org_owner;
-    let plan_type = access_claims
-        .get("chatgpt_plan_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let platform_url = if issuer == DEFAULT_ISSUER {
-        "https://platform.openai.com"
-    } else {
-        "https://platform.api.openai.org"
+    let codex_home = opts.codex_home.clone();
+    let auth_credentials_store_mode = opts.cli_auth_credentials_store_mode;
+    let keyring_backend_kind = opts.auth_keyring_backend_kind;
+    let id_token = exchanged.id_token.clone();
+    let access_token = exchanged.access_token.clone();
+    let refresh_token = exchanged.refresh_token.clone();
+    let workspace_login = opts.workspace_login.clone();
+    let provenance = AccountOAuthProvenance {
+        issuer: opts.issuer.clone(),
+        client_id: opts.client_id.clone(),
     };
+    // Blocking tasks don't inherit task-local context.
+    // Preserve the initiating client for credential-storage metrics.
+    let originator = AuthStorageOriginator::current();
 
-    let mut params = vec![
-        ("id_token", id_token.to_string()),
-        ("needs_setup", needs_setup.to_string()),
-        ("org_id", org_id.to_string()),
-        ("project_id", project_id.to_string()),
-        ("plan_type", plan_type.to_string()),
-        ("platform_url", platform_url.to_string()),
-    ];
-    if codex_streamlined_login {
-        params.push(("codex_streamlined_login", "true".to_string()));
-    }
-    let qs = params
-        .drain(..)
-        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(&v)))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("http://localhost:{port}/success?{qs}")
-}
+    let persist_task = tokio::task::spawn_blocking(move || {
+        originator.sync_scope(|| {
+            let mut tokens = TokenData {
+                id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
+                access_token,
+                refresh_token,
+                oauth_provenance: Some(provenance),
+                login_owner_id: Some(generate_state()),
+                account_id: None,
+            };
+            if let Some(acc) = jwt_auth_claims(&id_token)
+                .get("chatgpt_account_id")
+                .and_then(|v| v.as_str())
+            {
+                tokens.account_id = Some(acc.to_string());
+            }
+            let auth = AuthDotJson {
+                auth_mode: Some(AuthMode::Chatgpt),
+                openai_api_key: api_key,
+                tokens: Some(tokens),
+                last_refresh: Some(Utc::now()),
+                agent_identity: None,
+                personal_access_token: None,
+                bedrock_api_key: None,
+                bedrock_access_keys: None,
+            };
+            if let Some(login) = workspace_login {
+                return login.save(auth);
+            }
+            save_auth(
+                &codex_home,
+                &auth,
+                auth_credentials_store_mode,
+                keyring_backend_kind,
+            )
+        })
+    });
 
-fn jwt_auth_claims(jwt: &str) -> serde_json::Map<String, serde_json::Value> {
-    let mut parts = jwt.split('.');
-    let (_h, payload_b64, _s) = match (parts.next(), parts.next(), parts.next()) {
-        (Some(h), Some(p), Some(s)) if !h.is_empty() && !p.is_empty() && !s.is_empty() => (h, p, s),
-        _ => {
-            eprintln!("Invalid JWT format while extracting claims");
-            return serde_json::Map::new();
-        }
-    };
-    match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) {
-        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(mut v) => {
-                if let Some(obj) = v
-                    .get_mut("https://api.openai.com/auth")
-                    .and_then(|x| x.as_object_mut())
-                {
-                    return obj.clone();
-                }
-                eprintln!("JWT payload missing expected 'https://api.openai.com/auth' object");
-            }
-            Err(e) => {
-                eprintln!("Failed to parse JWT JSON payload: {e}");
-            }
-        },
-        Err(e) => {
-            eprintln!("Failed to base64url-decode JWT payload: {e}");
-        }
-    }
-    serde_json::Map::new()
+    persist_task
+        .await
+        .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
 }
 
 /// Validates the ID token against an optional workspace restriction.
@@ -1062,6 +998,20 @@ pub(crate) fn ensure_workspace_allowed(
     let claims = jwt_auth_claims(id_token);
     let Some(actual) = claims.get("chatgpt_account_id").and_then(JsonValue::as_str) else {
         return Err("Login is restricted to a specific workspace, but the token did not include an chatgpt_account_id claim.".to_string());
+    };
+
+    ensure_workspace_account_allowed(Some(expected), actual)
+}
+
+/// Validates an already known ChatGPT account ID against an optional workspace restriction.
+///
+/// PAT login calls this directly because `/whoami` supplies the account ID without an ID token.
+pub(crate) fn ensure_workspace_account_allowed(
+    expected: Option<&[String]>,
+    actual: &str,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
     };
 
     if expected.iter().any(|workspace_id| workspace_id == actual) {
@@ -1093,7 +1043,7 @@ fn login_error_response(
     }
 }
 
-/// Returns true when the OAuth callback represents a missing Sakrylle entitlement.
+/// Returns true when the OAuth callback represents a missing Codex entitlement.
 fn is_missing_codex_entitlement_error(error_code: &str, error_description: Option<&str>) -> bool {
     error_code == "access_denied"
         && error_description.is_some_and(|description| {
@@ -1106,7 +1056,7 @@ fn is_missing_codex_entitlement_error(error_code: &str, error_description: Optio
 /// Converts OAuth callback errors into a user-facing message.
 fn oauth_callback_error_message(error_code: &str, error_description: Option<&str>) -> String {
     if is_missing_codex_entitlement_error(error_code, error_description) {
-        return "Sakrylle is not enabled for your workspace. Contact your workspace administrator to request access to Sakrylle.".to_string();
+        return "Codex is not enabled for your workspace. Contact your workspace administrator to request access to Codex.".to_string();
     }
 
     if let Some(description) = error_description
@@ -1118,89 +1068,32 @@ fn oauth_callback_error_message(error_code: &str, error_description: Option<&str
     format!("Sign-in failed: {error_code}")
 }
 
-/// Extracts token endpoint error detail for both structured logging and caller-visible errors.
-///
-/// Parsed JSON fields are safe to log individually. If the response is not JSON, the raw body is
-/// preserved only for the returned error path so the CLI/browser can still surface the backend
-/// detail, while the structured log path continues to use the explicitly parsed safe fields above.
-fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return TokenEndpointErrorDetail {
-            error_code: None,
-            error_message: None,
-            display_message: "unknown error".to_string(),
-        };
-    }
-
-    let parsed = serde_json::from_str::<JsonValue>(trimmed).ok();
-    if let Some(json) = parsed {
-        let error_code = json
-            .get("error")
-            .and_then(JsonValue::as_str)
-            .filter(|error_code| !error_code.trim().is_empty())
-            .map(ToString::to_string)
-            .or_else(|| {
-                json.get("error")
-                    .and_then(JsonValue::as_object)
-                    .and_then(|error_obj| error_obj.get("code"))
-                    .and_then(JsonValue::as_str)
-                    .filter(|code| !code.trim().is_empty())
-                    .map(ToString::to_string)
-            });
-        if let Some(description) = json.get("error_description").and_then(JsonValue::as_str)
-            && !description.trim().is_empty()
-        {
-            return TokenEndpointErrorDetail {
-                error_code,
-                error_message: Some(description.to_string()),
-                display_message: description.to_string(),
-            };
-        }
-        if let Some(error_obj) = json.get("error")
-            && let Some(message) = error_obj.get("message").and_then(JsonValue::as_str)
-            && !message.trim().is_empty()
-        {
-            return TokenEndpointErrorDetail {
-                error_code,
-                error_message: Some(message.to_string()),
-                display_message: message.to_string(),
-            };
-        }
-        if let Some(error_code) = error_code {
-            return TokenEndpointErrorDetail {
-                display_message: error_code.clone(),
-                error_code: Some(error_code),
-                error_message: None,
-            };
-        }
-    }
-
-    // Preserve non-JSON token-endpoint bodies for the returned error so CLI/browser flows still
-    // surface the backend detail users and admins need, but keep that text out of structured logs
-    // by only logging explicitly parsed fields above and avoiding `%err` logging at the callback
-    // layer.
-    TokenEndpointErrorDetail {
-        error_code: None,
-        error_message: None,
-        display_message: trimmed.to_string(),
-    }
-}
-
-/// SAKRYLLE: OIDC login — renders the Sakrylle-branded error page used by callback failures.
+/// Renders the branded error page used by callback failures.
 fn render_login_error_page(
     message: &str,
     error_code: Option<&str>,
     error_description: Option<&str>,
 ) -> Vec<u8> {
     let code = error_code.unwrap_or("unknown_error");
-    let title = "Sign-in could not be completed".to_string();
-    let display_message = message.to_string();
-    let display_description = error_description.unwrap_or(message).to_string();
-    let help_text =
-        "Return to the terminal and try again. If the problem persists, check your account status."
-            .to_string();
-
+    let (title, display_message, display_description, help_text) =
+        if is_missing_codex_entitlement_error(code, error_description) {
+            (
+                "You do not have access to Codex".to_string(),
+                "This account is not currently authorized to use Codex in this workspace."
+                    .to_string(),
+                "Contact your workspace administrator to request access to Codex.".to_string(),
+                "Contact your workspace administrator to get access to Codex, then return to Codex and try again."
+                    .to_string(),
+            )
+        } else {
+            (
+                "Sign-in could not be completed".to_string(),
+                message.to_string(),
+                error_description.unwrap_or(message).to_string(),
+                "Return to Codex to retry, switch accounts, or contact your workspace admin if access is restricted."
+                    .to_string(),
+            )
+        };
     LOGIN_ERROR_PAGE_TEMPLATE
         .render([
             ("error_title", html_escape(&title)),
@@ -1231,6 +1124,7 @@ fn html_escape(input: &str) -> String {
 
 /// Exchanges an authenticated ID token for an API-key style access token.
 pub(crate) async fn obtain_api_key(
+    client: &HttpClient,
     issuer: &str,
     client_id: &str,
     id_token: &str,
@@ -1240,7 +1134,6 @@ pub(crate) async fn obtain_api_key(
     struct ExchangeResp {
         access_token: String,
     }
-    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
     let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
     let resp = client
         .post(token_endpoint)
@@ -1267,343 +1160,9 @@ pub(crate) async fn obtain_api_key(
 }
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-
-    use anyhow::Context;
-    use base64::Engine;
-    use codex_app_server_protocol::AuthMode;
-    use codex_config::types::AuthCredentialsStoreMode;
-    use serde_json::Value;
-    use serde_json::json;
-    use tempfile::tempdir;
-    use wiremock::Mock;
-    use wiremock::MockServer;
-    use wiremock::ResponseTemplate;
-    use wiremock::matchers::method;
-    use wiremock::matchers::path;
-
-    use crate::auth::AuthDotJson;
-    use crate::auth::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
-    use crate::auth::load_auth_dot_json;
-    use crate::auth::save_auth;
-    use crate::token_data::TokenData;
-    use crate::token_data::parse_chatgpt_jwt_claims;
-    use core_test_support::skip_if_no_network;
-    use pretty_assertions::assert_eq;
-
-    use super::DEFAULT_ISSUER;
-    use super::TokenEndpointErrorDetail;
-    use super::compose_success_url;
     use super::html_escape;
-    use super::oauth_callback_error_message;
-    use super::parse_token_endpoint_error;
-    use super::persist_tokens_async;
-    use super::redact_sensitive_query_value;
-    use super::redact_sensitive_url_parts;
+    use super::is_missing_codex_entitlement_error;
     use super::render_login_error_page;
-    use super::sanitize_url_for_logging;
-
-    #[serial_test::serial(logout_revoke)]
-    #[tokio::test]
-    async fn persist_tokens_async_revokes_previous_auth_without_failing_login() -> anyhow::Result<()>
-    {
-        skip_if_no_network!(Ok(()));
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/oauth/revoke"))
-            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
-                "error": {
-                    "message": "revoke failed"
-                }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let _env_guard = EnvGuard::set(
-            REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
-            format!("{}/oauth/revoke", server.uri()),
-        );
-
-        let codex_home = tempdir()?;
-        save_auth(
-            codex_home.path(),
-            &chatgpt_auth("old-access", "old-refresh", "old-account"),
-            AuthCredentialsStoreMode::File,
-        )?;
-
-        persist_tokens_async(
-            codex_home.path(),
-            /*api_key*/ None,
-            jwt_for_account("new-account"),
-            "new-access".to_string(),
-            "new-refresh".to_string(),
-            AuthCredentialsStoreMode::File,
-        )
-        .await?;
-
-        let auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)?
-            .context("auth.json should exist after login")?;
-        assert_eq!(
-            auth.tokens.context("new tokens should be persisted")?,
-            TokenData {
-                id_token: parse_chatgpt_jwt_claims(&jwt_for_account("new-account"))
-                    .expect("new JWT should parse"),
-                access_token: "new-access".to_string(),
-                refresh_token: "new-refresh".to_string(),
-                account_id: Some("new-account".to_string()),
-            }
-        );
-
-        let requests = server
-            .received_requests()
-            .await
-            .context("failed to fetch revoke requests")?;
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0]
-                .body_json::<Value>()
-                .context("revoke request should be JSON")?,
-            json!({
-                "token": "old-refresh",
-                "token_type_hint": "refresh_token",
-                "client_id": crate::auth::CLIENT_ID,
-            })
-        );
-        server.verify().await;
-        Ok(())
-    }
-
-    #[serial_test::serial(logout_revoke)]
-    #[tokio::test]
-    async fn persist_tokens_async_does_not_revoke_reused_refresh_token() -> anyhow::Result<()> {
-        skip_if_no_network!(Ok(()));
-
-        let server = MockServer::start().await;
-        let _env_guard = EnvGuard::set(
-            REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
-            format!("{}/oauth/revoke", server.uri()),
-        );
-
-        let codex_home = tempdir()?;
-        save_auth(
-            codex_home.path(),
-            &chatgpt_auth("old-access", "shared-refresh", "old-account"),
-            AuthCredentialsStoreMode::File,
-        )?;
-
-        persist_tokens_async(
-            codex_home.path(),
-            /*api_key*/ None,
-            jwt_for_account("new-account"),
-            "new-access".to_string(),
-            "shared-refresh".to_string(),
-            AuthCredentialsStoreMode::File,
-        )
-        .await?;
-
-        let requests = server
-            .received_requests()
-            .await
-            .context("failed to fetch revoke requests")?;
-        assert_eq!(requests.len(), 0);
-        Ok(())
-    }
-
-    fn chatgpt_auth(access_token: &str, refresh_token: &str, account_id: &str) -> AuthDotJson {
-        AuthDotJson {
-            auth_mode: Some(AuthMode::Chatgpt),
-            openai_api_key: None,
-            tokens: Some(TokenData {
-                id_token: parse_chatgpt_jwt_claims(&jwt_for_account(account_id))
-                    .expect("test JWT should parse"),
-                access_token: access_token.to_string(),
-                refresh_token: refresh_token.to_string(),
-                account_id: Some(account_id.to_string()),
-            }),
-            last_refresh: None,
-            agent_identity: None,
-        }
-    }
-
-    fn jwt_for_account(account_id: &str) -> String {
-        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-        let header_b64 = encode(br#"{"alg":"none","typ":"JWT"}"#);
-        let payload_b64 = encode(
-            serde_json::to_string(&json!({
-                "https://api.openai.com/auth": {
-                    "chatgpt_account_id": account_id,
-                }
-            }))
-            .expect("payload should serialize")
-            .as_bytes(),
-        );
-        let signature_b64 = encode(b"sig");
-        format!("{header_b64}.{payload_b64}.{signature_b64}")
-    }
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: String) -> Self {
-            let original = std::env::var_os(key);
-            // SAFETY: this test executes serially with other revoke tests.
-            unsafe {
-                std::env::set_var(key, &value);
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: the guard restores the original environment before other revoke tests run.
-            unsafe {
-                match &self.original {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn parse_token_endpoint_error_prefers_error_description() {
-        let detail = parse_token_endpoint_error(
-            r#"{"error":"invalid_grant","error_description":"refresh token expired"}"#,
-        );
-
-        assert_eq!(
-            detail,
-            TokenEndpointErrorDetail {
-                error_code: Some("invalid_grant".to_string()),
-                error_message: Some("refresh token expired".to_string()),
-                display_message: "refresh token expired".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_token_endpoint_error_reads_nested_error_message_and_code() {
-        let detail = parse_token_endpoint_error(
-            r#"{"error":{"code":"proxy_auth_required","message":"proxy authentication required"}}"#,
-        );
-
-        assert_eq!(
-            detail,
-            TokenEndpointErrorDetail {
-                error_code: Some("proxy_auth_required".to_string()),
-                error_message: Some("proxy authentication required".to_string()),
-                display_message: "proxy authentication required".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_token_endpoint_error_falls_back_to_error_code() {
-        let detail = parse_token_endpoint_error(r#"{"error":"temporarily_unavailable"}"#);
-
-        assert_eq!(
-            detail,
-            TokenEndpointErrorDetail {
-                error_code: Some("temporarily_unavailable".to_string()),
-                error_message: None,
-                display_message: "temporarily_unavailable".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_token_endpoint_error_preserves_plain_text_for_display() {
-        let detail = parse_token_endpoint_error("service unavailable");
-
-        assert_eq!(
-            detail,
-            TokenEndpointErrorDetail {
-                error_code: None,
-                error_message: None,
-                display_message: "service unavailable".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn redact_sensitive_query_value_only_scrubs_known_keys() {
-        assert_eq!(
-            redact_sensitive_query_value("code", "abc123"),
-            "<redacted>".to_string()
-        );
-        assert_eq!(
-            redact_sensitive_query_value("redirect_uri", "http://localhost:1455/auth/callback"),
-            "http://localhost:1455/auth/callback".to_string()
-        );
-    }
-
-    #[test]
-    fn redact_sensitive_url_parts_preserves_safe_url_shape() {
-        let mut url = url::Url::parse(
-            "https://user:pass@auth.openai.com/oauth/token?code=abc123&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback#frag",
-        )
-        .expect("valid url");
-
-        redact_sensitive_url_parts(&mut url);
-
-        assert_eq!(
-            url.as_str(),
-            "https://auth.openai.com/oauth/token?code=%3Credacted%3E&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"
-        );
-    }
-
-    #[test]
-    fn sanitize_url_for_logging_redacts_sensitive_issuer_parts() {
-        let redacted =
-            sanitize_url_for_logging("https://user:pass@example.com/base?token=abc123&env=prod");
-
-        assert_eq!(
-            redacted,
-            "https://example.com/base?token=%3Credacted%3E&env=prod".to_string()
-        );
-    }
-
-    #[test]
-    fn compose_success_url_omits_streamlined_success_by_default() {
-        let url = url::Url::parse(&compose_success_url(
-            /*port*/ 1455,
-            DEFAULT_ISSUER,
-            "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnt9fQ.sig",
-            "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnt9fQ.sig",
-            /*codex_streamlined_login*/ false,
-        ))
-        .expect("success url should parse");
-
-        assert_eq!(
-            url.query_pairs()
-                .find(|(key, _)| key == "codex_streamlined_login"),
-            None
-        );
-    }
-
-    #[test]
-    fn compose_success_url_includes_streamlined_success_when_requested() {
-        let url = url::Url::parse(&compose_success_url(
-            /*port*/ 1455,
-            DEFAULT_ISSUER,
-            "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnt9fQ.sig",
-            "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnt9fQ.sig",
-            /*codex_streamlined_login*/ true,
-        ))
-        .expect("success url should parse");
-
-        assert_eq!(
-            url.query_pairs()
-                .find(|(key, _)| key == "codex_streamlined_login")
-                .map(|(_, value)| value.into_owned()),
-            Some("true".to_string())
-        );
-    }
 
     #[test]
     fn render_login_error_page_escapes_dynamic_fields() {
@@ -1621,14 +1180,22 @@ mod tests {
     }
 
     #[test]
-    fn oauth_callback_error_message_uses_sakrylle_entitlement_copy() {
+    fn render_login_error_page_uses_entitlement_copy() {
         let error_description = Some("missing_codex_entitlement");
+        assert!(is_missing_codex_entitlement_error(
+            "access_denied",
+            error_description
+        ));
 
-        let message = oauth_callback_error_message("access_denied", error_description);
+        let body = String::from_utf8(render_login_error_page(
+            "access denied",
+            Some("access_denied"),
+            error_description,
+        ))
+        .expect("login error page should be utf-8");
 
-        assert_eq!(
-            message,
-            "Sakrylle is not enabled for your workspace. Contact your workspace administrator to request access to Sakrylle."
-        );
+        assert!(body.contains("You do not have access to Codex"));
+        assert!(body.contains("Contact your workspace administrator"));
+        assert!(!body.contains("missing_codex_entitlement"));
     }
 }

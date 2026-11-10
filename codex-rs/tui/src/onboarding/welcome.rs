@@ -1,3 +1,5 @@
+//! Shared welcome header for the existing sign-in and Bedrock onboarding pickers.
+
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -9,8 +11,6 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::WidgetRef;
 use ratatui::widgets::Wrap;
 
-use crate::key_hint::KeyBindingListExt;
-use crate::onboarding::keys;
 use crate::onboarding::onboarding_screen::KeyboardHandler;
 use crate::onboarding::onboarding_screen::StepStateProvider;
 use crate::tui::FrameRequester;
@@ -23,7 +23,7 @@ pub(crate) struct WelcomeWidget {
 
 impl KeyboardHandler for WelcomeWidget {
     fn handle_key_event(&mut self, _key_event: KeyEvent) {
-        // No animation to toggle
+        // SAKRYLLE: ASCII welcome animation stays removed.
     }
 }
 
@@ -33,18 +33,18 @@ impl WelcomeWidget {
         _request_frame: FrameRequester,
         _animations_enabled: bool,
     ) -> Self {
-        Self {
-            is_logged_in,
-        }
+        Self { is_logged_in }
     }
 
-    pub(crate) fn update_layout_area(&self, _area: Rect) {
-        // No-op
+    pub(crate) fn update_layout_area(&self, _area: Rect) {}
+
+    pub(crate) fn set_presentation(
+        &self,
+        _presentation: crate::empty_state_animation::Presentation,
+    ) {
     }
 
-    pub(crate) fn set_animations_suppressed(&self, _suppressed: bool) {
-        // No-op
-    }
+    pub(crate) fn set_focused(&self, _focused: bool) {}
 }
 
 impl WidgetRef for WelcomeWidget {
@@ -95,9 +95,11 @@ mod tests {
 
     #[test]
     fn welcome_renders_sakrylle() {
-        let widget = WelcomeWidget {
-            is_logged_in: false,
-        };
+        let widget = WelcomeWidget::new(
+            /*is_logged_in*/ false,
+            FrameRequester::test_dummy(),
+            /*animations_enabled*/ false,
+        );
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         widget.render_ref(area, &mut buf);
