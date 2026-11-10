@@ -5,12 +5,14 @@ use serde::de::{self};
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::oidc::SAKRYLLE_SCOPE;
+use crate::oidc::fetch_discovery;
 use crate::oidc::validate_discovery;
 use crate::oidc::verify_id_token;
+use crate::server::ExchangedTokens;
 use crate::server::ServerOptions;
 use crate::server::ensure_workspace_allowed;
-use crate::server::fetch_discovery;
-use codex_client::build_reqwest_client_with_custom_ca;
+use codex_http_client::build_reqwest_client_with_custom_ca;
 use std::io;
 
 const ANSI_BLUE: &str = "\x1b[94m";
@@ -201,8 +203,8 @@ async fn poll_for_token(
 fn print_device_code_prompt(verification_url: &str, code: &str) {
     let version = env!("CARGO_PKG_VERSION");
     println!(
-        "\nWelcome to Codex [v{ANSI_GRAY}{version}{ANSI_RESET}]\n{ANSI_GRAY}OpenAI's command-line coding agent{ANSI_RESET}\n\
-\nFollow these steps to sign in with ChatGPT using device code authorization:\n\
+        "\nWelcome to Sakrylle [v{ANSI_GRAY}{version}{ANSI_RESET}]\n{ANSI_GRAY}Sakrylle command-line coding agent{ANSI_RESET}\n\
+\nFollow these steps to sign in using device code authorization:\n\
 \n1. Open this link in your browser and sign in to your account\n   {ANSI_BLUE}{verification_url}{ANSI_RESET}\n\
 \n2. Enter this one-time code {ANSI_GRAY}(expires in 15 minutes){ANSI_RESET}\n   {ANSI_BLUE}{code}{ANSI_RESET}\n\
 \n{ANSI_GRAY}Device codes are a common phishing target. Never share this code.{ANSI_RESET}\n",
@@ -213,7 +215,11 @@ fn print_device_code_prompt(verification_url: &str, code: &str) {
 pub async fn request_device_code(opts: &ServerOptions) -> std::io::Result<DeviceCode> {
     // SAKRYLLE: OIDC login — fetch discovery to get device_authorization_endpoint
     let discovery = fetch_discovery(&opts.issuer).await?;
-    validate_discovery(&discovery, &opts.issuer, /*require_device_endpoint*/ true)?;
+    validate_discovery(
+        &discovery,
+        &opts.issuer,
+        /*require_device_endpoint*/ true,
+    )?;
     let device_auth_endpoint = discovery
         .device_authorization_endpoint
         .as_deref()
@@ -226,7 +232,7 @@ pub async fn request_device_code(opts: &ServerOptions) -> std::io::Result<Device
 
     let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
     // SAKRYLLE: OIDC login — use Sakrylle scope
-    let scope = crate::server::SAKRYLLE_SCOPE;
+    let scope = SAKRYLLE_SCOPE;
     let uc = request_user_code(&client, device_auth_endpoint, &opts.client_id, scope).await?;
 
     Ok(DeviceCode {
@@ -244,7 +250,11 @@ pub async fn complete_device_code_login(
 ) -> std::io::Result<()> {
     // SAKRYLLE: OIDC login — fetch discovery for token endpoint
     let discovery = fetch_discovery(&opts.issuer).await?;
-    validate_discovery(&discovery, &opts.issuer, /*require_device_endpoint*/ true)?;
+    validate_discovery(
+        &discovery,
+        &opts.issuer,
+        /*require_device_endpoint*/ true,
+    )?;
     let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())?;
 
     // SAKRYLLE: OIDC login — poll the token endpoint directly (RFC 8628)
@@ -279,12 +289,13 @@ pub async fn complete_device_code_login(
 
     // SAKRYLLE: OIDC login — persist tokens directly after strict ID token validation.
     crate::server::persist_tokens_async(
-        &opts.codex_home,
+        &opts,
         /*api_key*/ None,
-        verified_id_token.raw,
-        token_resp.access_token,
-        token_resp.refresh_token,
-        opts.cli_auth_credentials_store_mode,
+        &ExchangedTokens {
+            id_token: verified_id_token.raw,
+            access_token: token_resp.access_token,
+            refresh_token: token_resp.refresh_token,
+        },
     )
     .await
 }
