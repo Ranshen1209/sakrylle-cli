@@ -1200,7 +1200,7 @@ impl App {
                     subtitle: Some("Quitting this TUI will stop its running sessions.".into()),
                     items: vec![
                         SelectionItem {
-                            name: "Stay in Codex".into(),
+                            name: "Stay in Sakrylle".into(),
                             dismiss_on_select: true,
                             ..Default::default()
                         },
